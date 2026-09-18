@@ -71,8 +71,10 @@ fix_owner_permissions() {
   chown pihole:pihole "${1}"
   chmod 664 "${1}"
 
-  # Ensure the containing directory is group writable
-  chmod g+w "$(dirname -- "${1}")"
+  # Ensure the containing directory is owned by pihole:pihole
+  # so the pihole user can write to it without requiring group-write
+  # permissions (which would change the directory mode unexpectedly)
+  chown pihole:pihole "$(dirname -- "${1}")"
 }
 
 # Generate new SQLite3 file from schema template
@@ -86,16 +88,17 @@ generate_gravity_database() {
 
 # Build gravity tree
 gravity_build_tree() {
+  local table="$1"
   local str
-  str="Building tree"
+  str="Building ${table} tree"
   echo -ne "  ${INFO} ${str}..."
 
   # The index is intentionally not UNIQUE as poor quality adlists may contain domains more than once
-  output=$({ pihole-FTL sqlite3 -ni "${gravityTEMPfile}" "CREATE INDEX idx_gravity ON gravity (domain, adlist_id);"; } 2>&1)
+  output=$({ pihole-FTL sqlite3 -ni "${gravityTEMPfile}" "CREATE INDEX idx_${table} ON ${table} (domain, adlist_id);"; } 2>&1)
   status="$?"
 
   if [[ "${status}" -ne 0 ]]; then
-    echo -e "\\n  ${CROSS} Unable to build gravity tree in ${gravityTEMPfile}\\n  ${output}"
+    echo -e "\\n  ${CROSS} Unable to build ${table} tree in ${gravityTEMPfile}\\n  ${output}"
     echo -e "  ${INFO} If you have a large amount of domains, make sure your Pi-hole has enough RAM available\\n"
     return 1
   fi
@@ -183,11 +186,9 @@ database_table_from_file() {
   src="${2}"
   backup_path="${piholeDir}/migration_backup"
   backup_file="${backup_path}/$(basename "${2}")"
-  # Create a temporary file. We don't use '--suffix' here because not all
-  # implementations of mktemp support it, e.g. on Alpine
-  tmpFile="$(mktemp -p "${GRAVITY_TMPDIR}")"
-  mv "${tmpFile}" "${tmpFile%.*}.gravity"
-  tmpFile="${tmpFile%.*}.gravity"
+  # Create a temporary file with random filename with '.gravity' suffix.
+  # Note: '--suffix' requires GNU mktemp (coreutils), which is not pre-installed on Alpine, but it is installed as Pi-hole dependency.
+  tmpFile="$(mktemp -p "${GRAVITY_TMPDIR}" --suffix=".gravity")"
 
   local timestamp
   timestamp="$(date --utc +'%s')"
@@ -611,16 +612,15 @@ compareLists() {
 # Download specified URL and perform checks on HTTP status and file content
 gravity_DownloadBlocklistFromUrl() {
   local url="${1}" adlistID="${2}" saveLocation="${3}" compression="${4}" gravity_type="${5}" domain="${6}"
-  local listCurlBuffer str httpCode success="" ip customUpstreamResolver=""
-  local file_path permissions ip_addr port blocked=false download=true
+  local listCurlBuffer str curlVersion curlOutput httpCode curlErrorMsg="" curlExitCode="" curlOutputFormat=""
+  local success="" ip customUpstreamResolver="" file_path ip_addr port blocked=false download=true
   # modifiedOptions is an array to store all the options used to check if the adlist has been changed upstream
   local modifiedOptions=()
 
   # Create temp file to store content on disk instead of RAM
-  # We don't use '--suffix' here because not all implementations of mktemp support it, e.g. on Alpine
-  listCurlBuffer="$(mktemp -p "${GRAVITY_TMPDIR}")"
-  mv "${listCurlBuffer}" "${listCurlBuffer%.*}.phgpb"
-  listCurlBuffer="${listCurlBuffer%.*}.phgpb"
+  # Create a temporary file with random filename with '.phgpb' suffix.
+  # Note: '--suffix' requires GNU mktemp (coreutils), which is not pre-installed on Alpine, but it is installed as Pi-hole dependency.
+  listCurlBuffer=$(mktemp -p "${GRAVITY_TMPDIR}" --suffix=".phgpb")
 
   # For all remote files, we try to determine if the file has changed to skip
   # downloading them whenever possible.
@@ -721,29 +721,40 @@ gravity_DownloadBlocklistFromUrl() {
     fi
   fi
 
-  # If we are going to "download" a local file, we first check if the target
-  # file has a+r permission. We explicitly check for all+read because we want
-  # to make sure that the file is readable by everyone and not just the user
-  # running the script.
-  if [[ $url == "file://"* ]]; then
+  # If we "download" a local file (file://), verify read access before using it.
+  # When running as root (e.g., via pihole -g), check that the 'pihole' user can read the file
+  # to match the effective runtime user of FTL; otherwise, check the current user's read access
+  # (e.g., in Docker or when invoked by a non-root user). The target must
+  # resolve to a regular file and be readable by the evaluated user.
+  if [[ "${url}" == "file:/"* ]]; then
     # Get the file path
-    file_path=$(echo "$url" | cut -d'/' -f3-)
+    file_path=$(echo "${url}" | cut -d'/' -f3-)
     # Check if the file exists and is a regular file (i.e. not a socket, fifo, tty, block). Might still be a symlink.
-    if [[ ! -f $file_path ]]; then
-      # Output that the file does not exist
-      echo -e "${OVER}  ${CROSS} ${file_path} does not exist"
-      download=false
-    else
-      # Check if the file or a file referenced by the symlink has a+r permissions
-      permissions=$(stat -L -c "%a" "$file_path")
-      if [[ $permissions == *4 || $permissions == *5 || $permissions == *6 || $permissions == *7 ]]; then
-        # Output that we are using the local file
-        echo -e "${OVER}  ${INFO} Using local file ${file_path}"
-      else
-        # Output that the file does not have the correct permissions
-        echo -e "${OVER}  ${CROSS} Cannot read file (file needs to have a+r permission)"
+    if [[ ! -f ${file_path} ]]; then
+        # Output that the file does not exist
+        echo -e "${OVER}  ${CROSS} ${file_path} does not exist"
         download=false
-      fi
+    else
+        if [ "$(id -un)" == "root" ]; then
+            # If we are root, we need to check if the pihole user has read permission
+            #  otherwise, we might read files that the pihole user should not be able to read
+            if sudo -u pihole test -r "${file_path}"; then
+                echo -e "${OVER}  ${INFO} Using local file ${file_path}"
+            else
+                echo -e "${OVER}  ${CROSS} Cannot read file (user 'pihole' lacks read permission)"
+                download=false
+            fi
+        else
+            # If we are not root, we just check if the current user has read permission
+            if [[ -r "${file_path}" ]]; then
+                # Output that we are using the local file
+                echo -e "${OVER}  ${INFO} Using local file ${file_path}"
+            else
+                # Output that the file is not readable by the current user
+                echo -e "${OVER}  ${CROSS} Cannot read file (current user '$(id -un)' lacks read permission)"
+                download=false
+            fi
+        fi
     fi
   fi
 
@@ -755,44 +766,79 @@ gravity_DownloadBlocklistFromUrl() {
   fi
 
   if [[ "${download}" == true ]]; then
-    httpCode=$(curl --connect-timeout ${curl_connect_timeout} -s -L ${compression:+${compression}} ${customUpstreamResolver:+${customUpstreamResolver}} "${modifiedOptions[@]}" -w "%{http_code}" "${url}" -o "${listCurlBuffer}" 2>/dev/null)
-  fi
+    # Define the generic error message
+    curlOutputFormat='%{http_code};No message available. Non supported curl version.'
 
-  case $url in
-  # Did we "download" a local file?
-  "file"*)
-    if [[ -s "${listCurlBuffer}" ]]; then
-      echo -e "${OVER}  ${TICK} ${str} Retrieval successful"
-      success=true
-    else
-      echo -e "${OVER}  ${CROSS} ${str} Retrieval failed / empty list"
+    # Get the current installed curl version.
+    curlVersion=$(curl --version | awk '{print $2;exit}')
+
+    # Check if the installed curl version supports the "-w %{errormsg}" option.
+    # The minimum curl version supporting this option is 7.75.0.
+    # (https://github.com/pi-hole/pi-hole/pull/6605#discussion_r3112153347)
+    #
+    # We use "awk" to compare versions by subtracting 7.75 from the version number.
+    # If the result is greater than or equal to zero, the option is supported.
+    # (see https://github.com/pi-hole/pi-hole/issues/6615)
+    #
+    # Notes:
+    # - Use parameter expansion to get only Major and Minor version parts (containing only one dot).
+    # - The comparison result will be true or false. We use it as exit code.
+    # - awk considers "true=1". We negate the comparison to exit with "0" when a desired version is found.
+    if echo "${curlVersion%.*}" | awk '{exit !($1 - 7.75 >= 0)}'; then
+        # Use the error message returned by curl
+        curlOutputFormat='%{http_code};%{errormsg}'
     fi
-    ;;
-  # Did we "download" a remote file?
-  *)
-    # Determine "Status:" output based on HTTP response
-    case "${httpCode}" in
-    "200")
-      echo -e "${OVER}  ${TICK} ${str} Retrieval successful"
-      success=true
+
+    # This command will output the HTTP code and an error message, if available.
+    # Error messages are suppressed by "-s" option.
+    # By default curl returns exitcode=0 even an HTTP code happens (403, 404, 500, etc). To fix
+    # this, we use the "--fail" option to force curl to return a non-zero exit code.
+    # If curl version is older than 7.75.0, curl can't generate the errormsg output. In this case,
+    # a generic message is returned.
+    curlOutput=$(curl --connect-timeout ${curl_connect_timeout} -s --fail -L ${compression:+${compression}} ${customUpstreamResolver:+${customUpstreamResolver}} "${modifiedOptions[@]}" -w "${curlOutputFormat}" "${url}" -o "${listCurlBuffer}")
+    curlExitCode="$?"
+
+
+    # Retrieve http_code and errormsg values, returned by curl command
+    IFS=";" read -r httpCode curlErrorMsg <<<"$curlOutput"
+
+    case $url in
+    # Did we "download" a local file?
+    "file"*)
+      if [[ -s "${listCurlBuffer}" ]]; then
+        echo -e "${OVER}  ${TICK} ${str} Retrieval successful"
+        success=true
+      else
+        echo -e "${OVER}  ${CROSS} ${str} Retrieval failed / empty list"
+      fi
       ;;
-    "304")
-      echo -e "${OVER}  ${TICK} ${str} No changes detected"
-      success=true
+    # Did we "download" a remote file?
+    *)
+      # Use the exit code to determine if curl was successful or not.
+      # Use HTTP code only to select the correct error message.
+      if [[ "${curlExitCode}" == "0" ]]; then
+        case "${httpCode}" in
+          "200") echo -e "${OVER}  ${TICK} ${str} Retrieval successful" ;;
+          "304") echo -e "${OVER}  ${TICK} ${str} No changes detected"  ;;
+          *) echo -e "${OVER}  ${TICK} ${str} Success (http_code=${COL_CYAN}${httpCode}${COL_NC})"  ;;
+        esac
+        success=true
+      else
+        case "${httpCode}" in
+          "403") echo -e "${OVER}  ${CROSS} ${str} Forbidden" ;;
+          "404") echo -e "${OVER}  ${CROSS} ${str} Not found" ;;
+          "408") echo -e "${OVER}  ${CROSS} ${str} Time-out" ;;
+          "451") echo -e "${OVER}  ${CROSS} ${str} Unavailable For Legal Reasons" ;;
+          "500") echo -e "${OVER}  ${CROSS} ${str} Internal Server Error" ;;
+          "504") echo -e "${OVER}  ${CROSS} ${str} Connection Timed Out (Gateway)" ;;
+          "521") echo -e "${OVER}  ${CROSS} ${str} Web Server Is Down (Cloudflare)" ;;
+          "522") echo -e "${OVER}  ${CROSS} ${str} Connection Timed Out (Cloudflare)" ;;
+          *) echo -e "${OVER}  ${CROSS} ${str} Retrieval failed (exit_code=${COL_CYAN}${curlExitCode}${COL_NC} Msg: ${COL_CYAN}${curlErrorMsg}${COL_NC})" ;;
+        esac
+      fi
       ;;
-    "000") echo -e "${OVER}  ${CROSS} ${str} Connection Refused" ;;
-    "403") echo -e "${OVER}  ${CROSS} ${str} Forbidden" ;;
-    "404") echo -e "${OVER}  ${CROSS} ${str} Not found" ;;
-    "408") echo -e "${OVER}  ${CROSS} ${str} Time-out" ;;
-    "451") echo -e "${OVER}  ${CROSS} ${str} Unavailable For Legal Reasons" ;;
-    "500") echo -e "${OVER}  ${CROSS} ${str} Internal Server Error" ;;
-    "504") echo -e "${OVER}  ${CROSS} ${str} Connection Timed Out (Gateway)" ;;
-    "521") echo -e "${OVER}  ${CROSS} ${str} Web Server Is Down (Cloudflare)" ;;
-    "522") echo -e "${OVER}  ${CROSS} ${str} Connection Timed Out (Cloudflare)" ;;
-    *) echo -e "${OVER}  ${CROSS} ${str} ${url} (${httpCode})" ;;
     esac
-    ;;
-  esac
+  fi
 
   local done="false"
   # Determine if the blocklist was downloaded and saved correctly
@@ -811,6 +857,10 @@ gravity_DownloadBlocklistFromUrl() {
       fix_owner_permissions "${saveLocation}"
       # Compare lists if they are identical
       compareLists "${adlistID}" "${saveLocation}"
+      # Set permissions for the *.etag file
+      if [[ -f "${saveLocation}.etag" ]]; then
+          fix_owner_permissions "${saveLocation}.etag"
+      fi
       # Add domains to database table file
       pihole-FTL "${gravity_type}" parseList "${saveLocation}" "${gravityTEMPfile}" "${adlistID}"
       done="true"
@@ -844,11 +894,11 @@ gravity_Table_Count() {
   local str="${2}"
   local num
   num="$(pihole-FTL sqlite3 -ni "${gravityTEMPfile}" "SELECT COUNT(*) FROM ${table};")"
-  if [[ "${table}" == "gravity" ]]; then
+  if [[ "${table}" == "gravity" || "${table}" == "antigravity" ]]; then
     local unique
     unique="$(pihole-FTL sqlite3 -ni "${gravityTEMPfile}" "SELECT COUNT(*) FROM (SELECT DISTINCT domain FROM ${table});")"
     echo -e "  ${INFO} Number of ${str}: ${num} (${COL_BOLD}${unique} unique domains${COL_NC})"
-    pihole-FTL sqlite3 -ni "${gravityTEMPfile}" "INSERT OR REPLACE INTO info (property,value) VALUES ('gravity_count',${unique});"
+    pihole-FTL sqlite3 -ni "${gravityTEMPfile}" "INSERT OR REPLACE INTO info (property,value) VALUES ('${table}_count',${unique});"
   else
     echo -e "  ${INFO} Number of ${str}: ${num}"
   fi
@@ -858,11 +908,14 @@ gravity_Table_Count() {
 gravity_ShowCount() {
   # Here we use the table "gravity" instead of the view "vw_gravity" for speed.
   # It's safe to replace it here, because right after a gravity run both will show the exactly same number of domains.
+  echo ""
   gravity_Table_Count "gravity" "gravity domains"
+  gravity_Table_Count "antigravity" "antigravity domains"
   gravity_Table_Count "domainlist WHERE type = 1 AND enabled = 1" "exact denied domains"
   gravity_Table_Count "domainlist WHERE type = 3 AND enabled = 1" "regex denied filters"
   gravity_Table_Count "domainlist WHERE type = 0 AND enabled = 1" "exact allowed domains"
   gravity_Table_Count "domainlist WHERE type = 2 AND enabled = 1" "regex allowed filters"
+  echo ""
 }
 
 # Trap Ctrl-C
@@ -882,8 +935,8 @@ gravity_Cleanup() {
   rm ${piholeDir}/*.tmp 2>/dev/null
   # listCurlBuffer location
   rm "${GRAVITY_TMPDIR}"/*.phgpb 2>/dev/null
-  # invalid_domains location
-  rm "${GRAVITY_TMPDIR}"/*.ph-non-domains 2>/dev/null
+  # list to database parsing location
+  rm "${GRAVITY_TMPDIR}"/*.gravity 2>/dev/null
 
   # Ensure this function only runs when gravity_DownloadBlocklists() has completed
   if [[ "${DownloadBlocklists_done:-}" == true ]]; then
@@ -910,6 +963,8 @@ database_recovery() {
   local result
   local str="Checking integrity of existing gravity database (this can take a while)"
   local option="${1}"
+  local recoverySQL="${gravityDBfile}.recovery.sql"
+  trap 'rm -f "${recoverySQL}"' RETURN
   echo -ne "  ${INFO} ${str}..."
   result="$(pihole-FTL sqlite3 -ni "${gravityDBfile}" "PRAGMA integrity_check" 2>&1)"
 
@@ -938,17 +993,26 @@ database_recovery() {
   echo -ne "  ${INFO} ${str}..."
   # We have to remove any possibly existing recovery database or this will fail
   rm -f "${gravityDBfile}.recovered" >/dev/null 2>&1
-  if result="$(pihole-FTL sqlite3 -ni "${gravityDBfile}" ".recover" | pihole-FTL sqlite3 -ni "${gravityDBfile}.recovered" 2>&1)"; then
-    echo -e "${OVER}  ${TICK} ${str} - success"
-    mv "${gravityDBfile}" "${gravityDBfile}.old"
-    mv "${gravityDBfile}.recovered" "${gravityDBfile}"
-    echo -ne " ${INFO} ${gravityDBfile} has been recovered"
-    echo -ne " ${INFO} The old ${gravityDBfile} has been moved to ${gravityDBfile}.old"
+  # Stage .recover output to a temp file so each command's exit status can
+  # be checked independently. Piping would hide a failing .recover because
+  # bash reports the RHS exit status for the whole pipe.
+  if pihole-FTL sqlite3 -ni "${gravityDBfile}" ".recover" > "${recoverySQL}"; then
+    if result="$(pihole-FTL sqlite3 -ni "${gravityDBfile}.recovered" < "${recoverySQL}" 2>&1)"; then
+      echo -e "${OVER}  ${TICK} ${str} - success"
+      mv "${gravityDBfile}" "${gravityDBfile}.old"
+      mv "${gravityDBfile}.recovered" "${gravityDBfile}"
+      echo -ne " ${INFO} ${gravityDBfile} has been recovered"
+      echo -ne " ${INFO} The old ${gravityDBfile} has been moved to ${gravityDBfile}.old"
+    else
+      echo -e "${OVER}  ${CROSS} ${str} - the following errors happened:"
+      while IFS= read -r line; do echo "  - $line"; done <<<"$result"
+      echo -e "  ${CROSS} Recovery failed. Try \"pihole -g -r recreate\" instead."
+      return 1
+    fi
   else
-    echo -e "${OVER}  ${CROSS} ${str} - the following errors happened:"
-    while IFS= read -r line; do echo "  - $line"; done <<<"$result"
+    echo -e "${OVER}  ${CROSS} ${str} - .recover command failed"
     echo -e "  ${CROSS} Recovery failed. Try \"pihole -g -r recreate\" instead."
-    exit 1
+    return 1
   fi
   echo ""
 }
@@ -1116,7 +1180,7 @@ if [[ "${recreate_database:-}" == true ]]; then
 fi
 
 if [[ "${recover_database:-}" == true ]]; then
-  timeit database_recovery "$4"
+  timeit database_recovery "$4" || exit 1
 fi
 
 # Migrate scattered list files to the new cache directory
@@ -1149,7 +1213,12 @@ update_gravity_timestamp
 fix_owner_permissions "${gravityTEMPfile}"
 
 # Build the tree
-timeit gravity_build_tree
+if ! timeit gravity_build_tree gravity; then
+  exit 1
+fi
+if ! timeit gravity_build_tree antigravity; then
+  exit 1
+fi
 
 # Compute numbers to be displayed (do this after building the tree to get the
 # numbers quickly from the tree instead of having to scan the whole database)
